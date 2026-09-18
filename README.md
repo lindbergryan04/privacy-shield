@@ -12,7 +12,8 @@ It runs a local DNS server that answers blocklisted domains itself and sends eve
 - 🚫 **Block trackers & ads** at the DNS level (a listed domain blocks its subdomains too)
 - ➕ **Add your own blocklists** from a URL or a file (hosts, plain domains, or `||domain^` format)
 - ⛔ **Blacklist / whitelist**: always block or always allow any domain, right from the app
-- 📊 **Live session stats** and a list of what was just blocked
+- 📊 **Analytics page** with trackers blocked per hour, day or month, top blocked domains, blocks per list, and all-time totals
+- 🕵️ **Live session stats** and a list of what was just blocked
 - ⚡ **Fast**: answers are cached, so repeat lookups take about a millisecond instead of a round trip
 - 🔒 **DNS-over-HTTPS** via Cloudflare, failing over to Google
 - 🛡️ **Works with Mullvad VPN**, connected or not
@@ -52,6 +53,7 @@ Open **Privacy Shield** (or run `python app.py` from the project folder).
 - Click **Start DNS Proxy**. macOS asks for your password once per app session.
 - The status turns **Protected**. Blocked domains show up in the list as they happen. If a site breaks, double-click the domain to allow it.
 - Type a domain (or paste a URL) and click **Block** or **Allow** to always block or always allow it. This takes effect within a second or two, even while protection is on.
+- **Analytics…** opens charts of what's been blocked today, over the last 30 days, the last 12 months, or all time, with a table view of the same numbers.
 - Click **Stop DNS Proxy**, or just quit, to put your DNS settings back.
 
 To try the app without the password prompt or changing any settings:
@@ -119,6 +121,7 @@ dig @127.0.0.1 -p 5300 doubleclick.net
 ```
 privacy-shield/
 ├── app.py              # PyQt5 GUI; runs the DNS filter
+├── analytics.py        # the analytics page (charts drawn with QPainter)
 ├── dns_proxy.py        # DNS filter + DNS-over-HTTPS upstreams
 ├── shield_helper.py    # the only part that runs as root: port 53 + DNS settings
 ├── launcher.py         # entry point of the built app
@@ -129,7 +132,7 @@ privacy-shield/
 ├── blocklists/         # Curated tracker/ad blocklists
 ├── whitelist.txt       # Domains always allowed (optional, one per line)
 ├── blacklist.txt       # Domains always blocked (optional, one per line)
-├── stats.json          # Session & cumulative stats
+├── stats.json          # older versions' totals (carried over into stats.db once)
 ├── requirements.txt
 └── README.md
 ```
@@ -141,6 +144,7 @@ privacy-shield/
 - A listed domain also blocks its subdomains (`doubleclick.net` blocks `ad.doubleclick.net`), matched on whole labels, so `x.com` doesn't block `netflix.com`.
 - Your blacklist and whitelist beat the blocklists. Between the two, the more specific entry wins: whitelisting `example.com` and blacklisting `ads.example.com` blocks only `ads.example.com`. A tie goes to the whitelist. Edits take effect within a second or two, no restart needed.
 - The built app keeps your whitelist, blacklist and stats in `~/Library/Application Support/PrivacyShield/` (the first build copies in `whitelist.txt` and `blacklist.txt`). Running from source uses the copies in the project folder. Lists you add under **Custom lists…** live in `~/Library/Application Support/PrivacyShield/blocklists/` either way.
+- Stats are kept in `~/Library/Application Support/PrivacyShield/stats.db` (shared by the app and source runs). Only blocked domains are recorded by name; allowed lookups are only counted, so the history never says which sites you visited. Totals from older versions' `stats.json` are carried over once.
 - Answered locally and never forwarded: `.local` names, single-label names, reverse lookups for private IPs, and `use-application-dns.net` (which tells Firefox to use the system resolver instead of its own built-in DoH).
 - DNS-over-HTTPS upstreams are listed at the top of `dns_proxy.py`. They're reached by IP (no DNS needed to find them) and certificates are checked against the real hostname.
 - macOS only.

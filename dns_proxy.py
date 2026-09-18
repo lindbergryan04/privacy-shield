@@ -9,8 +9,9 @@ To try it by itself on an unprivileged port:
     python dns_proxy.py --port 5300 --lists moderate social
     dig @127.0.0.1 -p 5300 doubleclick.net
 """
-import argparse, collections, ipaddress, itertools, json, os, re, socket, ssl, struct, subprocess, sys
-import threading, time
+import argparse, collections, datetime, ipaddress, itertools, json, os, re, socket, sqlite3, ssl, struct
+import subprocess, sys, threading, time
+from contextlib import closing
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import certifi, urllib3
@@ -26,7 +27,10 @@ BUILTIN_LIST_DIR = os.path.join(BASE_DIR, "blocklists")
 CUSTOM_LIST_DIR = os.path.join(SUPPORT_DIR, "blocklists")  # lists you add; shared by app and source
 WHITELIST_FILE = os.path.join(DATA_DIR, "whitelist.txt")
 BLACKLIST_FILE = os.path.join(DATA_DIR, "blacklist.txt")
-STATS_FILE = os.path.join(DATA_DIR, "stats.json")
+STATS_DB = os.path.join(SUPPORT_DIR, "stats.db")  # all-time history; shared by app and source
+# Where older versions kept their totals (the app's, and the repo's when running from source).
+# Both are carried over into stats.db once.
+LEGACY_STATS = sorted({os.path.join(SUPPORT_DIR, "stats.json"), os.path.join(DATA_DIR, "stats.json")})
 if FROZEN:
     os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -102,13 +106,18 @@ def clean_domain(token):
     return name
 
 
+_ZONE_WORDS = frozenset({"SOA", "NS", "IN", "CNAME", "A", "AAAA", "TXT"})
+
+
 def parse_domains(lines):
-    """Domains from hosts-file lines ("0.0.0.0 ads.example.com"), plain one-per-line lists and
-    adblock-style rules ("||ads.example.com^"). Comments and other rule types are skipped."""
+    """Domains from hosts-file lines ("0.0.0.0 ads.example.com"), plain lists ("ads.example.com"
+    or "*.ads.example.com"), adblock rules ("||ads.example.com^"), dnsmasq rules
+    ("local=/ads.example.com/") and RPZ zones ("ads.example.com CNAME ."). Comments and other
+    rule types are skipped."""
     domains = set()
     for line in lines:
         line = line.strip()
-        if not line or line[0] in "#![":  # comments and adblock headers
+        if not line or line[0] in "#![;$@":  # comments, adblock headers, zone-file directives
             continue
         if line.startswith("||"):
             if line.endswith("^") and "$" not in line and "/" not in line:
@@ -116,7 +125,18 @@ def parse_domains(lines):
                 if name:
                     domains.add(name)
             continue
+        if line.startswith(("local=/", "address=/", "server=/")):
+            name = clean_domain(line.split("/")[1])
+            if name:
+                domains.add(name)
+            continue
         parts = line.split("#", 1)[0].split()
+        if len(parts) > 1 and (parts[0] in _ZONE_WORDS or parts[1] in _ZONE_WORDS):
+            if parts[1] == "CNAME" and parts[-1] == ".":  # RPZ: "ads.example.com CNAME ." blocks it
+                name = clean_domain(parts[0])
+                if name:
+                    domains.add(name)
+            continue  # other zone-file records (SOA, NS) aren't rules
         for token in parts[1:] if len(parts) > 1 else parts:
             name = clean_domain(token)
             if name:
@@ -239,7 +259,9 @@ def _download(url):
         if resp.status != 200:
             raise ValueError(f"The server said HTTP {resp.status}.")
         chunks, size = [], 0
-        for chunk in resp.stream(65536):
+        # decode_content must be explicit: without it, chunked gzip responses (jsDelivr sends
+        # those) come through still compressed.
+        for chunk in resp.stream(65536, decode_content=True):
             size += len(chunk)
             if size > MAX_LIST_BYTES:
                 raise ValueError("That's over 50 MB. Is it the right URL?")
@@ -249,57 +271,137 @@ def _download(url):
     return b"".join(chunks).decode("utf-8", errors="ignore")
 
 
-# ----- stats (in memory, saved to stats.json every second or so) -----
+# ----- stats: live counters for the window, plus all-time history in SQLite -----
+BLACKLIST_NAME = "Your blacklist"  # how blocks by your blacklist show up in the stats
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS hourly (hour INTEGER PRIMARY KEY, blocked INTEGER NOT NULL,
+    allowed INTEGER NOT NULL, cached INTEGER NOT NULL, failed INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS domains (day TEXT NOT NULL, domain TEXT NOT NULL,
+    blocked INTEGER NOT NULL, PRIMARY KEY (day, domain)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS lists (day TEXT NOT NULL, list TEXT NOT NULL,
+    blocked INTEGER NOT NULL, PRIMARY KEY (day, list)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""
+_BLOCKED, _ALLOWED, _CACHED, _FAILED = range(4)
+
+
+def _add_months(dt, n):
+    years, month = divmod(dt.month - 1 + n, 12)
+    return dt.replace(year=dt.year + years, month=month + 1)
+
+
+def _bucket_start(dt, unit):
+    dt = dt.replace(minute=0, second=0, microsecond=0)
+    if unit == "hour":
+        return dt
+    dt = dt.replace(hour=0)
+    return dt if unit == "day" else dt.replace(day=1)
+
+
 class Stats:
-    def __init__(self, path=STATS_FILE):
+    """Counters for the window, and all-time history in a small SQLite database written about
+    once a second. Blocked domains are recorded by name; allowed lookups are only counted, so
+    the history never says which sites you visited."""
+
+    def __init__(self, path=STATS_DB, legacy=LEGACY_STATS):
         self.path = path
+        self.legacy = [legacy] if isinstance(legacy, str) else list(legacy)
         self.lock = threading.Lock()
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                data = {}
-        except (OSError, ValueError):
-            data = {}
-
-        def num(key, default=0):
-            value = data.get(key, default)
-            return value if isinstance(value, (int, float)) else default
-
-        now = time.time()
-        self.blocked = int(num("blocked"))
-        self.allowed = int(num("allowed"))
-        self.last_reset = num("last_reset", now)
-        self.session_blocked = int(num("session_blocked"))
-        self.session_allowed = int(num("session_allowed"))
-        self.session_started = num("session_started", now)
-        self.failed = 0
-        self.cache_hits = 0
+        self.session_blocked = self.session_allowed = self.failed = self.cache_hits = 0
         self.recent = collections.deque(maxlen=200)  # (time, name) of recent blocks
-        self._dirty = False
+        self._counts = collections.Counter()   # (hour, field) -> n, not written yet
+        self._domains = collections.Counter()  # (day, domain) -> n
+        self._lists = collections.Counter()    # (day, list) -> n
+        self._opened = False  # the database is opened on first use, not at import
+
+    @property
+    def total_blocked(self):
+        self._open()
+        return self._baseline[0] + self._stored[0] + self._counted[0]
+
+    @property
+    def total_allowed(self):
+        self._open()
+        return self._baseline[1] + self._stored[1] + self._counted[1]
+
+    @property
+    def since(self):
+        self._open()
+        return self._since
+
+    def _connect(self):
+        db = sqlite3.connect(self.path, timeout=5)
+        db.execute("PRAGMA journal_mode=WAL")  # the analytics page can read while we write
+        return db
+
+    def _open(self):
+        if self._opened:
+            return
+        with self.lock:
+            if self._opened:
+                return
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with closing(self._connect()) as db, db:
+                db.executescript(_SCHEMA)
+                meta = dict(db.execute("SELECT key, value FROM meta"))
+                if not meta:  # first run: carry over the totals older versions kept
+                    meta = self._legacy_totals()
+                    db.executemany("INSERT INTO meta VALUES (?, ?)", meta.items())
+                blocked, allowed = db.execute("SELECT TOTAL(blocked), TOTAL(allowed) FROM hourly").fetchone()
+            self._since = float(meta["since"])
+            self._baseline = (int(meta["baseline_blocked"]), int(meta["baseline_allowed"]))
+            self._stored = (int(blocked), int(allowed))  # already in the database at startup
+            self._counted = [0, 0]                        # counted by this process since
+            self._opened = True
+
+    def _legacy_totals(self):
+        since, blocked, allowed = time.time(), 0, 0
+        for path in self.legacy:
+            try:
+                with open(path) as f:
+                    old = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(old, dict):
+                continue
+            num = lambda key: old.get(key) if isinstance(old.get(key), (int, float)) else 0  # noqa: E731
+            blocked, allowed = blocked + int(num("blocked")), allowed + int(num("allowed"))
+            if num("last_reset"):
+                since = min(since, num("last_reset"))
+        return {"since": str(since), "baseline_blocked": str(blocked), "baseline_allowed": str(allowed)}
 
     def new_session(self):
         with self.lock:
             self.session_blocked = self.session_allowed = self.failed = self.cache_hits = 0
-            self.session_started = time.time()
             self.recent.clear()
-            self._dirty = True
-        self.flush()
 
-    def record(self, blocked, name=None, cached=False):
+    def record(self, blocked, name=None, cached=False, source=None):
+        self._open()
+        now = time.time()
+        hour = int(now // 3600)
         with self.lock:
             if blocked:
-                self.blocked += 1
+                self._counts[hour, _BLOCKED] += 1
                 self.session_blocked += 1
-                self.recent.append((time.time(), name))
+                self._counted[0] += 1
+                self.recent.append((now, name))
+                day = time.strftime("%Y-%m-%d", time.localtime(now))
+                self._domains[day, name] += 1
+                if source:
+                    self._lists[day, source] += 1
             else:
-                self.allowed += 1
+                self._counts[hour, _ALLOWED] += 1
                 self.session_allowed += 1
-                self.cache_hits += cached
-            self._dirty = True
+                self._counted[1] += 1
+                if cached:
+                    self._counts[hour, _CACHED] += 1
+                    self.cache_hits += 1
 
     def record_failure(self):
+        self._open()
         with self.lock:
+            self._counts[int(time.time() // 3600), _FAILED] += 1
             self.failed += 1
 
     def recent_blocked(self, limit=50):
@@ -316,29 +418,91 @@ class Stats:
         return names
 
     def flush(self):
+        """Write what's been counted since the last flush."""
+        if not self._opened:
+            return  # nothing counted yet
         with self.lock:
-            if not self._dirty:
+            counts, domains, lists = self._counts, self._domains, self._lists
+            if not (counts or domains or lists):
                 return
-            data = {
-                "blocked": self.blocked, "allowed": self.allowed, "last_reset": self.last_reset,
-                "session_blocked": self.session_blocked, "session_allowed": self.session_allowed,
-                "session_started": self.session_started,
-            }
-            self._dirty = False
-        tmp = self.path + ".tmp"
+            self._counts, self._domains, self._lists = (collections.Counter(), collections.Counter(),
+                                                        collections.Counter())
+        rows = collections.defaultdict(lambda: [0, 0, 0, 0])
+        for (hour, field), n in counts.items():
+            rows[hour][field] += n
         try:
-            with open(tmp, "w") as f:
-                json.dump(data, f)
-            os.replace(tmp, self.path)  # atomic
-        except OSError as e:
+            with closing(self._connect()) as db, db:
+                db.executemany(
+                    "INSERT INTO hourly VALUES (?, ?, ?, ?, ?) ON CONFLICT (hour) DO UPDATE SET "
+                    "blocked = blocked + excluded.blocked, allowed = allowed + excluded.allowed, "
+                    "cached = cached + excluded.cached, failed = failed + excluded.failed",
+                    [(hour, *r) for hour, r in rows.items()])
+                for table, column, counter in (("domains", "domain", domains), ("lists", "list", lists)):
+                    db.executemany(
+                        f"INSERT INTO {table} VALUES (?, ?, ?) ON CONFLICT (day, {column}) "
+                        "DO UPDATE SET blocked = blocked + excluded.blocked",
+                        [(*key, n) for key, n in counter.items()])
+        except sqlite3.Error as e:
             print(f"[!] Couldn't save stats: {e}")
+            with self.lock:  # keep them for the next try
+                self._counts.update(counts)
+                self._domains.update(domains)
+                self._lists.update(lists)
+
+    def report(self, period):
+        """Numbers for the analytics page. period is "today", "30d", "12m" or "all"."""
+        self._open()
+        self.flush()
+        now = datetime.datetime.now()
+        today = _bucket_start(now, "day")
+        with closing(self._connect()) as db:
+            if period == "today":
+                start, unit, count = today, "hour", 24
+            elif period == "30d":
+                start, unit, count = today - datetime.timedelta(days=29), "day", 30
+            elif period == "12m":
+                start, unit, count = _add_months(_bucket_start(now, "month"), -11), "month", 12
+            else:
+                first = db.execute("SELECT MIN(hour) FROM hourly").fetchone()[0]
+                start = _bucket_start(datetime.datetime.fromtimestamp(first * 3600) if first else now, "month")
+                unit = "month"
+                count = (now.year - start.year) * 12 + now.month - start.month + 1
+            rows = db.execute("SELECT hour, blocked, allowed, cached, failed FROM hourly WHERE hour >= ?",
+                              (int(start.timestamp() // 3600),)).fetchall()
+            first_day = start.strftime("%Y-%m-%d")
+            top = db.execute("SELECT domain, SUM(blocked) FROM domains WHERE day >= ? GROUP BY domain "
+                             "ORDER BY 2 DESC, 1 LIMIT 10", (first_day,)).fetchall()
+            by_list = db.execute("SELECT list, SUM(blocked) FROM lists WHERE day >= ? GROUP BY list "
+                                 "ORDER BY 2 DESC, 1", (first_day,)).fetchall()
+
+        if unit == "hour":
+            starts = [start + datetime.timedelta(hours=i) for i in range(count)]
+        elif unit == "day":
+            starts = [start + datetime.timedelta(days=i) for i in range(count)]
+        else:
+            starts = [_add_months(start, i) for i in range(count)]
+        slot = {s: i for i, s in enumerate(starts)}
+        series = [[s, 0, 0] for s in starts]  # bucket start, blocked, lookups
+        blocked = allowed = cached = failed = 0
+        for hour, b, a, c, f in rows:
+            i = slot.get(_bucket_start(datetime.datetime.fromtimestamp(hour * 3600), unit))
+            if i is not None:
+                series[i][1] += b
+                series[i][2] += b + a + f
+            blocked, allowed, cached, failed = blocked + b, allowed + a, cached + c, failed + f
+        if period == "all":  # what the old stats.json had counted before this history began
+            blocked += self._baseline[0]
+            allowed += self._baseline[1]
+        return {"unit": unit, "series": series, "blocked": blocked, "allowed": allowed,
+                "cached": cached, "lookups": blocked + allowed + failed, "top": top,
+                "lists": by_list, "since": datetime.datetime.fromtimestamp(self._since)}
 
 
 stats = Stats()
 
 
 def start_new_session():
-    """Reset only session counters; keep cumulative totals."""
+    """Reset only session counters; the all-time history keeps going."""
     stats.new_session()
 
 
@@ -682,11 +846,13 @@ class ShieldServer:
     """Serves DNS on already-bound UDP and TCP sockets until stop() is called."""
 
     def __init__(self, udp_sock, tcp_sock, blocklists, whitelist=None, blacklist=None):
+        """blocklists is {name: path}; the name is what the stats credit a block to."""
         self.udp, self.tcp = udp_sock, tcp_sock
-        self.blocklist_paths = list(blocklists)
+        self.blocklists = dict(blocklists)
         self.whitelist_path = whitelist or WHITELIST_FILE
         self.blacklist_path = blacklist or BLACKLIST_FILE
-        self.blocked, self.allowed, self.denied = set(), set(), set()
+        self.blocked = {}  # domain -> name of the first list that has it
+        self.allowed, self.denied = set(), set()
         self.upstreams = Upstreams()
         self.cache = _Cache()
         self._mtimes = {}
@@ -698,9 +864,10 @@ class ShieldServer:
 
     def start(self):
         self._reload_user_lists()
-        blocked = set()
-        for path in self.blocklist_paths:
-            blocked |= load_blocklist(path)
+        blocked = {}
+        for name, path in self.blocklists.items():
+            for domain in load_blocklist(path):
+                blocked.setdefault(domain, name)
         self.blocked = blocked
         print(f"[+] Loaded {len(self.blocked)} blocked, {len(self.denied)} blacklisted and "
               f"{len(self.allowed)} whitelisted domains")
@@ -735,15 +902,19 @@ class ShieldServer:
                 changed = True
         return changed
 
-    def is_blocked(self, qname):
-        """Your blacklist and whitelist beat the blocklists. Between those two the more specific
+    def block_reason(self, qname):
+        """What blocks qname (BLACKLIST_NAME or a blocklist's name), or None if nothing does.
+        Your blacklist and whitelist beat the blocklists. Between those two the more specific
         entry wins (whitelisted example.com plus blacklisted ads.example.com blocks just ads.),
         and a tie goes to the whitelist."""
         allow = _match(qname, self.allowed)
         deny = _match(qname, self.denied)
         if deny and (not allow or len(deny) > len(allow)):
-            return True
-        return not allow and _match(qname, self.blocked) is not None
+            return BLACKLIST_NAME
+        if allow:
+            return None
+        hit = _match(qname, self.blocked)
+        return self.blocked[hit] if hit else None
 
     def local_answer(self, request):
         """The response if no upstream is needed (blocked, local-only, malformed), else None."""
@@ -754,8 +925,9 @@ class ShieldServer:
         qname = str(request.q.qname).rstrip(".").lower()
         if _local_only(qname):
             return _reply(request, RCODE.NXDOMAIN).pack()
-        if self.is_blocked(qname):
-            stats.record(blocked=True, name=qname)
+        reason = self.block_reason(qname)
+        if reason:
+            stats.record(blocked=True, name=qname, source=reason)
             return _blocked_reply(request).pack()
         return None
 
@@ -937,12 +1109,12 @@ def main():
     parser.add_argument("--lists", nargs="*", default=["moderate"],
                         help=f"blocklists to use: {', '.join(available_blocklists())}")
     args = parser.parse_args()
-    paths = [blocklist_path(n) for n in args.lists]
-    if None in paths:
+    lists = {name: blocklist_path(name) for name in args.lists}
+    if None in lists.values():
         parser.error(f"unknown list; choose from {', '.join(available_blocklists())}")
 
     udp, tcp = bind_sockets(args.port)
-    server = ShieldServer(udp, tcp, paths)
+    server = ShieldServer(udp, tcp, lists)
     server.start()
     print(f"[+] Listening on 127.0.0.1:{args.port}. Try: dig @127.0.0.1 -p {args.port} example.com")
     try:

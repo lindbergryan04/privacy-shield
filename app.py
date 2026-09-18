@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import (
     QStyledItemDelegate,
 )
 from PyQt5.QtCore import Qt, QEvent, QTimer, QObject, QSettings, pyqtSignal
+import analytics
 import dns_proxy
 
 HELPER = os.path.join(dns_proxy.BASE_DIR, "shield_helper.py")
@@ -436,6 +437,7 @@ class PrivacyShieldApp(QWidget):
         self.active = False
         self.closing = False
         self.mullvad_state = None
+        self.analytics = None
         self._shown_recent = []
 
         layout = QVBoxLayout()
@@ -447,8 +449,13 @@ class PrivacyShieldApp(QWidget):
         self.detail_label.setWordWrap(True)
         layout.addWidget(self.detail_label)
 
-        self.label = QLabel("Trackers blocked this session: 0")
-        layout.addWidget(self.label)
+        stats_row = QHBoxLayout()
+        self.label = QLabel("Trackers blocked: 0 this session")
+        stats_row.addWidget(self.label, 1)
+        analytics_btn = QPushButton("Analytics…")
+        analytics_btn.clicked.connect(self.open_analytics)
+        stats_row.addWidget(analytics_btn)
+        layout.addLayout(stats_row)
 
         # Dropdown with multiple checkable blocklists: the bundled ones plus any you added
         self.combo = CheckableComboBox()
@@ -579,8 +586,8 @@ class PrivacyShieldApp(QWidget):
         if not self.helper.connected:
             self.helper.launch()
         udp, tcp = self.helper.sockets
-        paths = [p for p in map(dns_proxy.blocklist_path, names) if p]
-        server = dns_proxy.ShieldServer(udp, tcp, paths)
+        lists = {name: path for name in names if (path := dns_proxy.blocklist_path(name))}
+        server = dns_proxy.ShieldServer(udp, tcp, lists)
         server.start()
         # Only touch DNS settings once the shield has proven it can answer.
         if not dns_proxy.probe(self.helper.port):
@@ -727,13 +734,21 @@ class PrivacyShieldApp(QWidget):
     # ----- status display -----
     def update_stats(self):
         s = dns_proxy.stats
-        self.label.setText(f"Trackers blocked this session: {s.session_blocked}")
+        self.label.setText(f"Trackers blocked: {s.session_blocked:,} this session, "
+                           f"{s.total_blocked:,} all time")
         recent = s.recent_blocked(50)
         if recent != self._shown_recent:
             self._shown_recent = recent
             self.recent_list.clear()
             self.recent_list.addItems(recent)
         self._update_footer()
+
+    def open_analytics(self):
+        if self.analytics is None:
+            self.analytics = analytics.AnalyticsDialog(self)
+        self.analytics.show()
+        self.analytics.raise_()
+        self.analytics.activateWindow()
 
     def poll_mullvad(self):
         threading.Thread(target=lambda: self.bridge.mullvad.emit(mullvad_status()), daemon=True).start()
@@ -787,14 +802,14 @@ def selftest():
     helper handoff in dry-run mode on port 5300, a DNS-over-HTTPS lookup, and blocking."""
     global DRY_RUN
     DRY_RUN = True
-    dns_proxy.stats = dns_proxy.Stats(os.path.join(tempfile.mkdtemp(), "stats.json"))
+    dns_proxy.stats = dns_proxy.Stats(os.path.join(tempfile.mkdtemp(), "stats.db"))
     lists = dns_proxy.available_blocklists()
     print("Blocklists:", ", ".join(lists))
     helper, server, checks = HelperConnection(lambda msg: None), None, []
     try:
         helper.launch(timeout=30)
         checks.append(("helper started and handed over its sockets", True))
-        server = dns_proxy.ShieldServer(*helper.sockets, list(lists.values()))
+        server = dns_proxy.ShieldServer(*helper.sockets, lists)
         server.start()
         checks.append(("example.com resolves through the shield", dns_proxy.probe(helper.port)))
         checks.append(("doubleclick.net is blocked",
@@ -825,7 +840,7 @@ def main():
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        QApplication(sys.argv)
+        app = QApplication(sys.argv)  # keep a reference: the message box needs it alive  # noqa: F841
         QMessageBox.information(None, "Privacy Shield", "Privacy Shield is already open.")
         sys.exit(0)
     if dns_proxy.FROZEN:
