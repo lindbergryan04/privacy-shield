@@ -1,3 +1,8 @@
 notes/
 whitelist.txt
+blacklist.txt
 adult.txt
+__pycache__/
+stats.json.tmp
+build/
+dist/
