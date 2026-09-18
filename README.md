@@ -1,6 +1,5 @@
 # Privacy Shield v0.2.0
 
-Looking to retain your humanity under the tin fist of Big Tech?  
 **Privacy Shield** is a lightweight desktop app that blocks trackers at the DNS level and gives you real-time visibility into what’s being blocked.
 
 It runs a local DNS server that answers blocklisted domains itself and sends everything else over DNS-over-HTTPS, with a whitelist for safe domains and a simple PyQt5 desktop UI. It works with or without Mullvad VPN.
